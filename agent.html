@@ -1,0 +1,350 @@
+<!-- key2agent: paste an LLM API key, get a code agent in your notebook.
+     Loaded as a notebook output:  from IPython.display import HTML; HTML(url="<raw url of this file>") -->
+<style>
+.kca{--kca-font:var(--jp-code-font-family,Menlo,Consolas,"DejaVu Sans Mono",monospace);--kca-size:var(--jp-code-font-size,13px);
+  --kca-fg:var(--jp-content-font-color1,#212121);--kca-dim:var(--jp-cell-prompt-not-active-font-color,#616161);
+  --kca-bg:var(--jp-cell-editor-background,#f5f5f5);--kca-bd:var(--jp-cell-editor-border-color,#e0e0e0);
+  --kca-hi:var(--jp-cell-editor-active-border-color,#1976d2);--kca-err:var(--jp-error-color1,#d32f2f);
+  font-family:var(--kca-font);font-size:var(--kca-size);line-height:1.5;color:var(--kca-fg);padding:4px 0 24px}
+.kca *{box-sizing:border-box}
+.kca-cell{display:flex;align-items:flex-start;margin:6px 0}
+.kca-prompt{flex:0 0 64px;padding:7px 8px 0 0;text-align:right;color:var(--kca-dim);opacity:.5;white-space:pre;user-select:none}
+.kca-prompt.kca-busy{cursor:pointer;opacity:.9}
+.kca-in,.kca-cell textarea,.kca-cell input{flex:1 1 auto;min-width:0;min-height:38px;margin:0;padding:8px 9px;background:var(--kca-bg);
+  border:1px solid var(--kca-bd);border-radius:0;color:var(--kca-fg);font:inherit;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.kca-cell textarea,.kca-cell input{display:block;width:100%;resize:none;outline:none;overflow:hidden;box-shadow:none}
+.kca-cell textarea:focus,.kca-cell input:focus{border-color:var(--kca-hi)}
+.kca-cell ::placeholder{color:var(--kca-dim);opacity:.45}
+.kca-out{margin:0 0 10px 64px;padding:2px 0}
+.kca-text{white-space:pre-wrap;word-break:break-word;margin:6px 0;font-family:var(--jp-content-font-family,system-ui,sans-serif);font-size:var(--jp-content-font-size1,14px)}
+.kca-text code,.kca-text pre{font-family:var(--kca-font);font-size:var(--kca-size);background:var(--kca-bg)}
+.kca-text code{padding:1px 4px}
+.kca-text pre{padding:8px 9px;margin:6px 0;overflow-x:auto;white-space:pre}
+.kca-code{margin:6px 0;border-left:2px solid var(--kca-bd)}
+.kca-code pre{margin:0;padding:6px 9px;overflow-x:auto;white-space:pre;font:inherit}
+.kca-code pre.kca-src{background:var(--kca-bg)}
+.kca-code pre.kca-res{white-space:pre-wrap;word-break:break-word;max-height:320px;overflow-y:auto}
+.kca-code img{display:block;max-width:100%;margin:6px 9px}
+.kca-note{color:var(--kca-dim);opacity:.8;margin:6px 0;white-space:pre-wrap}
+.kca-err{color:var(--kca-err);white-space:pre-wrap;word-break:break-word;margin:6px 0}
+</style>
+<div class="kca" data-lm-suppress-shortcuts="true"></div>
+<script>
+(function () {
+  var roots = document.querySelectorAll('.kca:not([data-kca-init])');
+  var root = roots[roots.length - 1];
+  if (!root) return;
+  root.setAttribute('data-kca-init', '1');
+
+  var MAX_STEPS = 40, MAX_TOOL_CHARS = 12000, EXEC_TIMEOUT_MS = 300000, STORE = 'key2agent.cfg';
+  var PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
+  var PRESETS = [
+    { test: /^sk-ant-/, provider: 'anthropic', name: 'Anthropic', base: 'https://api.anthropic.com', model: 'claude-opus-5-5' },
+    { test: /^AIza/, provider: 'openai', name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-pro' },
+    { test: /^sk-or-/, provider: 'openai', name: 'OpenRouter', base: 'https://openrouter.ai/api/v1', model: 'openrouter/auto' },
+    { test: /^gsk_/, provider: 'openai', name: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+    { test: /./, provider: 'openai', name: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-5' }
+  ];
+  var TOOL = {
+    name: 'run_python',
+    description: 'Execute Python code in the user\'s live notebook kernel and return stdout, stderr, the value of the last expression, and any error traceback. State (variables, imports, files) persists between calls and is shared with the user\'s notebook. Use it to inspect data, run analyses, install packages (%pip install), read/write files, and verify your work.',
+    schema: { type: 'object', properties: { code: { type: 'string', description: 'Python source to execute.' } }, required: ['code'] }
+  };
+  var SYSTEM = 'You are a code agent embedded in the user\'s notebook. You act by calling run_python, which executes code in their live Python kernel: the variables, dataframes and files they already have are available to you, and anything you define stays available to them.\n\n' +
+    'Work the task to completion: look before assuming (list variables, peek at dataframes and files), run code, read the output, fix errors, and check the result before reporting. Keep each run_python call focused and print only what you need to see; large outputs are truncated. Plots are shown to the user as they render.\n\n' +
+    'When done, answer briefly in plain text: what you found or built, and the names of any variables or files you created. Ask before deleting or overwriting the user\'s data or files.';
+
+  var S = { key: '', provider: '', name: '', base: '', model: '', messages: [], n: 0, busy: false, abort: null, kernel: null, useFallbacks: true };
+  var area, promptEl, inputEl;
+
+  // ---------- tiny DOM helpers ----------
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); }
+  function md(s) {
+    return esc(s).split(/```/).map(function (part, i) {
+      if (i % 2) return '<pre>' + part.replace(/^[\w+-]*\n/, '').replace(/\n$/, '') + '</pre>';
+      return part.replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    }).join('');
+  }
+  function add(parent, cls, text, html) { var e = el('div', cls, html ? null : text); if (html) e.innerHTML = text; parent.appendChild(e); e.scrollIntoView({ block: 'nearest' }); return e; }
+  function clip(s) {
+    if (s.length <= MAX_TOOL_CHARS) return s;
+    var h = Math.floor(MAX_TOOL_CHARS * 0.6), t = MAX_TOOL_CHARS - h;
+    return s.slice(0, h) + '\n\n[... output truncated: ' + (s.length - MAX_TOOL_CHARS) + ' characters omitted; print less or slice the data to see the rest ...]\n\n' + s.slice(-t);
+  }
+
+  // ---------- execution backends ----------
+  function uuid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, ''); }
+
+  function JupyterKernel(base, wsBase, token, info) {
+    this.base = base; this.wsBase = wsBase; this.token = token; this.id = info.id;
+    this.label = 'notebook kernel (' + info.name + ')'; this.sid = uuid(); this.pending = {}; this.ws = null;
+  }
+  JupyterKernel.prototype.open = function () {
+    var self = this;
+    if (this.ws && this.ws.readyState === 1) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var url = self.wsBase + 'api/kernels/' + self.id + '/channels?session_id=' + self.sid + (self.token ? '&token=' + encodeURIComponent(self.token) : '');
+      var ws = self.ws = new WebSocket(url);
+      ws.onopen = function () { resolve(); };
+      ws.onerror = function () { reject(new Error('could not open kernel websocket')); };
+      ws.onclose = function () { Object.keys(self.pending).forEach(function (k) { self.pending[k].fail(new Error('kernel connection closed')); }); self.pending = {}; };
+      ws.onmessage = function (ev) {
+        if (typeof ev.data !== 'string') return;
+        var m = JSON.parse(ev.data), p = self.pending[m.parent_header && m.parent_header.msg_id];
+        if (!p) return;
+        var c = m.content || {}, t = m.header.msg_type, r = p.res;
+        if (t === 'stream') r[c.name === 'stderr' ? 'stderr' : 'stdout'] += c.text;
+        else if (t === 'execute_result' || t === 'display_data') {
+          if (c.data['image/png']) { r.images.push(c.data['image/png']); if (p.onImage) p.onImage(c.data['image/png']); }
+          else if (c.data['text/plain']) r.result += (r.result ? '\n' : '') + c.data['text/plain'];
+        } else if (t === 'error') r.error = (c.traceback || [c.ename + ': ' + c.evalue]).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+        else if (t === 'status' && c.execution_state === 'idle') { delete self.pending[m.parent_header.msg_id]; p.done(r); }
+      };
+    });
+  };
+  JupyterKernel.prototype.run = function (code, onImage) {
+    var self = this;
+    return this.open().then(function () {
+      return new Promise(function (done, fail) {
+        var id = uuid();
+        self.pending[id] = { res: { stdout: '', stderr: '', result: '', error: '', images: [] }, done: done, fail: fail, onImage: onImage };
+        self.ws.send(JSON.stringify({
+          header: { msg_id: id, username: 'key2agent', session: self.sid, msg_type: 'execute_request', version: '5.3', date: new Date().toISOString() },
+          parent_header: {}, metadata: {}, channel: 'shell', buffers: [],
+          content: { code: code, silent: false, store_history: false, user_expressions: {}, allow_stdin: false, stop_on_error: true }
+        }));
+      });
+    });
+  };
+  JupyterKernel.prototype.interrupt = function () {
+    var h = this.token ? { Authorization: 'token ' + this.token } : {};
+    var x = document.cookie.match(/(?:^|;\s*)_xsrf=([^;]+)/); if (x) h['X-XSRFToken'] = x[1];
+    return fetch(this.base + 'api/kernels/' + this.id + '/interrupt', { method: 'POST', headers: h, credentials: 'same-origin' }).catch(function () {});
+  };
+
+  function connectJupyter() {
+    var cfg = window.KEY2AGENT_JUPYTER, node = document.getElementById('jupyter-config-data');
+    if (!cfg && node) cfg = JSON.parse(node.textContent);
+    if (!cfg && document.body.dataset.baseUrl) cfg = { baseUrl: document.body.dataset.baseUrl };
+    if (!cfg) return Promise.reject(new Error('no Jupyter server on this page'));
+    var base = new URL(cfg.baseUrl || '/', location.href).href.replace(/\/?$/, '/');
+    var wsBase = cfg.wsUrl ? cfg.wsUrl.replace(/\/$/, '') + new URL(base).pathname : base.replace(/^http/, 'ws');
+    var token = cfg.token || '';
+    return fetch(base + 'api/kernels', { headers: token ? { Authorization: 'token ' + token } : {}, credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) throw new Error('kernel list HTTP ' + r.status); return r.json(); })
+      .then(function (ks) {
+        if (!ks.length) throw new Error('no running kernels');
+        // The kernel that just rendered this output is the busy / most recently active one.
+        ks.sort(function (a, b) { return (b.execution_state === 'busy') - (a.execution_state === 'busy') || (a.last_activity < b.last_activity ? 1 : -1); });
+        var k = new JupyterKernel(base, wsBase, token, ks[0]);
+        return k.open().then(function () { return k; });
+      });
+  }
+
+  function connectPyodide() {
+    return new Promise(function (resolve, reject) {
+      if (window.loadPyodide) return resolve();
+      var s = document.createElement('script'); s.src = PYODIDE + 'pyodide.js';
+      s.onload = resolve; s.onerror = function () { reject(new Error('could not load Pyodide')); };
+      document.head.appendChild(s);
+    }).then(function () { return window.loadPyodide({ indexURL: PYODIDE }); }).then(function (py) {
+      return {
+        label: 'in-browser Python (Pyodide) — NOT your notebook kernel',
+        interrupt: function () {},
+        run: function (code) {
+          var r = { stdout: '', stderr: '', result: '', error: '', images: [] };
+          py.setStdout({ batched: function (s) { r.stdout += s + '\n'; } });
+          py.setStderr({ batched: function (s) { r.stderr += s + '\n'; } });
+          return py.loadPackagesFromImports(code).then(function () { return py.runPythonAsync(code); })
+            .then(function (v) { if (v !== undefined && v !== null) r.result = String(v); return r; },
+                  function (e) { r.error = String(e && e.message || e); return r; });
+        }
+      };
+    });
+  }
+
+  var kernelReady = connectJupyter().catch(function () { return connectPyodide(); }).then(function (k) { S.kernel = k; return k; });
+
+  function runPython(code, box) {
+    return kernelReady.then(function (k) {
+      var timer, timeout = new Promise(function (_, rej) { timer = setTimeout(function () { k.interrupt(); rej(new Error('timed out after ' + EXEC_TIMEOUT_MS / 1000 + 's')); }, EXEC_TIMEOUT_MS); });
+      var aborted = new Promise(function (_, rej) { S.abort.signal.addEventListener('abort', function () { k.interrupt(); rej(new Error('Interrupted by user')); }); });
+      var onImage = function (b64) { var i = el('img'); i.src = 'data:image/png;base64,' + b64; box.appendChild(i); };
+      return Promise.race([k.run(code, onImage), timeout, aborted]).finally(function () { clearTimeout(timer); });
+    }).then(function (r) {
+      var parts = [];
+      if (r.stdout) parts.push(r.stdout.replace(/\n$/, ''));
+      if (r.stderr) parts.push('[stderr]\n' + r.stderr.replace(/\n$/, ''));
+      if (r.result) parts.push(r.result);
+      if (r.images.length) parts.push('[' + r.images.length + ' image output(s) displayed to the user]');
+      if (r.error) parts.push(r.error);
+      return { text: clip(parts.join('\n') || '(no output)'), images: r.images, isError: !!r.error };
+    }, function (e) { return { text: String(e.message || e), images: [], isError: true }; });
+  }
+
+  // Runs one tool call, rendering code + result. Returns {text, images, isError}.
+  function doTool(input, out) {
+    var code = input && typeof input.code === 'string' ? input.code : null;
+    if (code == null) return Promise.resolve({ text: 'Invalid tool input: expected {"code": "<python source>"}.', images: [], isError: true });
+    var box = add(out, 'kca-code');
+    box.appendChild(el('pre', 'kca-src', code));
+    if (S.abort.signal.aborted) return Promise.resolve({ text: 'Interrupted by user', images: [], isError: true });
+    return runPython(code, box).then(function (r) {
+      var res = el('pre', 'kca-res' + (r.isError ? ' kca-err' : ''), r.text); box.appendChild(res); res.scrollIntoView({ block: 'nearest' });
+      return r;
+    });
+  }
+
+  // ---------- LLM providers ----------
+  function post(url, headers, body) {
+    headers['content-type'] = 'application/json';
+    return fetch(url, { method: 'POST', headers: headers, body: JSON.stringify(body), signal: S.abort.signal }).then(function (r) {
+      return r.text().then(function (t) {
+        var j = null; try { j = JSON.parse(t); } catch (e) {}
+        if (!r.ok) { var m = j && j.error && (j.error.message || j.error) || t.slice(0, 400); var err = new Error('HTTP ' + r.status + ': ' + (typeof m === 'string' ? m : JSON.stringify(m))); err.status = r.status; throw err; }
+        return j;
+      });
+    }, function (e) {
+      if (e.name === 'AbortError') throw e;
+      throw new Error('Request to ' + url + ' failed (' + e.message + '). The endpoint may be unreachable or may not allow browser (CORS) requests.');
+    });
+  }
+
+  function anthropicCall() {
+    var headers = { 'x-api-key': S.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
+    var body = { model: S.model, max_tokens: 16000, system: SYSTEM, messages: S.messages,
+      tools: [{ name: TOOL.name, description: TOOL.description, input_schema: TOOL.schema }] };
+    if (S.useFallbacks) { headers['anthropic-beta'] = 'server-side-fallback-2026-07-01'; body.fallbacks = 'default'; }
+    return post(S.base + '/v1/messages', headers, body).catch(function (e) {
+      // Models/accounts without server-side refusal fallbacks reject the parameter; retry once without it.
+      if (S.useFallbacks && e.status === 400) { S.useFallbacks = false; return anthropicCall(); }
+      throw e;
+    });
+  }
+  function anthropicStep(out) {
+    return anthropicCall().then(function (resp) {
+      if (resp.stop_reason === 'refusal') { add(out, 'kca-note', 'The model declined this request' + (resp.stop_details && resp.stop_details.category ? ' (' + resp.stop_details.category + ')' : '') + '.'); S.messages.pop(); return false; }
+      S.messages.push({ role: 'assistant', content: resp.content });
+      var uses = [];
+      resp.content.forEach(function (b) { if (b.type === 'text' && b.text.trim()) add(out, 'kca-text', md(b.text), true); else if (b.type === 'tool_use') uses.push(b); });
+      if (resp.stop_reason === 'max_tokens') add(out, 'kca-note', '(response hit the output limit)');
+      if (resp.stop_reason !== 'tool_use' || !uses.length) return false;
+      var results = [];
+      return uses.reduce(function (p, u) {
+        return p.then(function () { return doTool(u.input, out); }).then(function (r) {
+          var content = [{ type: 'text', text: r.text }];
+          r.images.slice(0, 4).forEach(function (b64) { content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } }); });
+          results.push({ type: 'tool_result', tool_use_id: u.id, content: content, is_error: r.isError });
+        });
+      }, Promise.resolve()).then(function () { S.messages.push({ role: 'user', content: results }); return true; });
+    });
+  }
+
+  function openaiStep(out) {
+    var body = { model: S.model, messages: [{ role: 'system', content: SYSTEM }].concat(S.messages),
+      tools: [{ type: 'function', function: { name: TOOL.name, description: TOOL.description, parameters: TOOL.schema } }] };
+    return post(S.base + '/chat/completions', { Authorization: 'Bearer ' + S.key }, body).then(function (resp) {
+      var choice = resp.choices && resp.choices[0]; if (!choice) throw new Error('Empty response from model');
+      var m = choice.message, calls = m.tool_calls || [];
+      S.messages.push(m);
+      if (typeof m.content === 'string' && m.content.trim()) add(out, 'kca-text', md(m.content), true);
+      if (choice.finish_reason === 'length') add(out, 'kca-note', '(response hit the output limit)');
+      if (!calls.length) return false;
+      return calls.reduce(function (p, c) {
+        return p.then(function () { var input = null; try { input = JSON.parse(c.function.arguments); } catch (e) {} return doTool(input, out); })
+          .then(function (r) { S.messages.push({ role: 'tool', tool_call_id: c.id, content: r.text }); });
+      }, Promise.resolve()).then(function () { return true; });
+    });
+  }
+
+  function agent(text, out) {
+    S.messages.push({ role: 'user', content: text });
+    var step = S.provider === 'anthropic' ? anthropicStep : openaiStep, i = 0;
+    function loop() {
+      if (S.abort.signal.aborted) { add(out, 'kca-note', '(stopped)'); return; }
+      if (i++ >= MAX_STEPS) { add(out, 'kca-note', '(paused after ' + MAX_STEPS + ' steps — send "continue" to keep going)'); return; }
+      return step(out).then(function (more) { if (more) return loop(); });
+    }
+    return loop();
+  }
+
+  // ---------- commands & config ----------
+  function setKey(key) {
+    var p = PRESETS.filter(function (x) { return x.test.test(key); })[0];
+    S.key = key; S.provider = p.provider; S.name = p.name; S.base = p.base; S.model = p.model; S.messages = [];
+  }
+  function describe() {
+    return S.name + ' · model ' + S.model + ' · ' + (S.kernel ? S.kernel.label : 'connecting to Python…') + '\n' +
+      'Enter sends, Shift+Enter adds a line, Esc (or click [*]) stops.\n' +
+      '/model <id>   switch model          /base <url>   OpenAI-compatible endpoint\n' +
+      '/key          enter a different key /clear        forget the conversation\n' +
+      '/remember     keep key in this browser (localStorage)   /forget   remove it';
+  }
+  function command(line, out) {
+    var m = line.match(/^\/(\w+)\s*(.*)$/), cmd = m[1], arg = m[2].trim();
+    if (cmd === 'model' && arg) { S.model = arg; add(out, 'kca-note', 'model → ' + arg); }
+    else if (cmd === 'base' && arg) { S.base = arg.replace(/\/$/, ''); S.provider = 'openai'; S.name = 'OpenAI-compatible'; S.messages = []; add(out, 'kca-note', 'endpoint → ' + S.base + ' (set the model with /model)'); }
+    else if (cmd === 'key') { S.key = ''; S.messages = []; }
+    else if (cmd === 'clear') { S.messages = []; add(out, 'kca-note', 'conversation cleared (kernel state is untouched)'); }
+    else if (cmd === 'remember') { try { localStorage.setItem(STORE, JSON.stringify({ key: S.key, provider: S.provider, name: S.name, base: S.base, model: S.model })); add(out, 'kca-note', 'saved in this browser'); } catch (e) { add(out, 'kca-err', 'browser storage is not available here'); } }
+    else if (cmd === 'forget') { try { localStorage.removeItem(STORE); } catch (e) {} add(out, 'kca-note', 'removed from this browser'); }
+    else add(out, 'kca-note', describe());
+  }
+
+  // ---------- the cell ----------
+  function grow() { if (inputEl.tagName === 'TEXTAREA') { inputEl.style.height = 'auto'; inputEl.style.height = Math.max(38, inputEl.scrollHeight + 2) + 'px'; } }
+  function newCell() {
+    var cell = el('div', 'kca-cell');
+    promptEl = el('div', 'kca-prompt', '[ ]:');
+    if (S.key) { inputEl = el('textarea'); inputEl.rows = 1; inputEl.placeholder = 'Ask the agent…  (/help)'; }
+    else { inputEl = el('input'); inputEl.type = 'password'; inputEl.autocomplete = 'off'; inputEl.placeholder = 'Paste an LLM API key and press Enter  (Anthropic, OpenAI, Gemini, OpenRouter, Groq)'; }
+    inputEl.spellcheck = false;
+    inputEl.addEventListener('input', grow);
+    inputEl.addEventListener('keydown', onKey);
+    promptEl.addEventListener('click', stop);
+    cell.appendChild(promptEl); cell.appendChild(inputEl); area.appendChild(cell);
+    inputEl.focus({ preventScroll: true });
+  }
+  function stop() { if (S.busy && S.abort) S.abort.abort(); }
+  function onKey(ev) {
+    ev.stopPropagation(); // keep notebook shortcuts away from what is typed here
+    if (ev.key === 'Escape') { stop(); return; }
+    if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || S.busy) return;
+    ev.preventDefault();
+    var text = inputEl.value.trim(); if (!text) return;
+    submit(text);
+  }
+  function submit(text) {
+    var cell = inputEl.parentNode, wasKey = !S.key, frozen = el('div', 'kca-in', wasKey ? '•'.repeat(12) : text);
+    var out = el('div', 'kca-out');
+    if (wasKey) {
+      setKey(text); cell.replaceChild(frozen, inputEl); promptEl.textContent = '[✓]:'; area.appendChild(out);
+      var note = add(out, 'kca-note', describe());
+      kernelReady.then(function () { note.textContent = describe(); }, function () { add(out, 'kca-err', 'No Python backend could be started; the agent can chat but not run code.'); });
+      newCell();
+      return;
+    }
+    if (text[0] === '/') { cell.replaceChild(frozen, inputEl); area.appendChild(out); command(text, out); newCell(); return; }
+    S.busy = true; S.abort = new AbortController();
+    inputEl.readOnly = true; promptEl.textContent = '[*]:'; promptEl.classList.add('kca-busy'); promptEl.title = 'Click to stop';
+    area.appendChild(out);
+    var p = promptEl, live = inputEl;
+    Promise.resolve().then(function () { return agent(text, out); }).catch(function (e) {
+      if (e.name === 'AbortError') add(out, 'kca-note', '(stopped)');
+      else add(out, 'kca-err', String(e.message || e));
+      // Drop a trailing turn the model never answered so the history stays valid.
+      var last = S.messages[S.messages.length - 1];
+      if (last && last.role === 'user' && typeof last.content === 'string') S.messages.pop();
+    }).then(function () {
+      S.busy = false; S.n += 1;
+      cell.replaceChild(frozen, live); p.textContent = '[' + S.n + ']:'; p.classList.remove('kca-busy'); p.title = '';
+      newCell();
+    });
+  }
+
+  area = root;
+  try { var saved = JSON.parse(localStorage.getItem(STORE) || 'null'); if (saved && saved.key) { S.key = saved.key; S.provider = saved.provider; S.name = saved.name; S.base = saved.base; S.model = saved.model; } } catch (e) {}
+  newCell();
+})();
+</script>
