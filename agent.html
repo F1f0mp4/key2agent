@@ -97,6 +97,39 @@
     }
     return out;
   }
+  // Puts the code into a real notebook cell right under this one (JupyterLab, DataLab, Notebook 7):
+  // reuses the empty or previously filled cell below, otherwise inserts a new one. Resolves false if it can't.
+  function putInCell(code) {
+    var cell = root.closest('.jp-Cell');
+    if (!cell) return Promise.resolve(false);
+    var editorOf = function (c) { var cm = c && c.querySelector('.jp-InputArea .cm-content'); return cm && cm.cmView && cm.cmView.view; };
+    var waitFor = function (get, ms) {
+      return new Promise(function (resolve) {
+        var t0 = Date.now();
+        (function poll() { var v = get(); if (v || Date.now() - t0 > ms) resolve(v); else setTimeout(poll, 50); })();
+      });
+    };
+    var next = cell.nextElementSibling, reuse = next && next.classList.contains('jp-CodeCell') &&
+      (next === S.answerCell || (editorOf(next) && !editorOf(next).state.doc.length));
+    var target = reuse ? Promise.resolve(next) : Promise.resolve().then(function () {
+      var button = function () { return cell.querySelector('.jp-cell-toolbar [data-command="notebook:insert-cell-below"]'); };
+      if (!button()) { // the toolbar only shows on the active cell, so activate ours
+        var at = cell.querySelector('.jp-InputPrompt') || cell;
+        ['mousedown', 'mouseup', 'click'].forEach(function (t) { at.dispatchEvent(new MouseEvent(t, { bubbles: true, button: 0 })); });
+      }
+      return waitFor(button, 1000).then(function (b) {
+        if (!b) return null;
+        b.click();
+        return waitFor(function () { return cell.nextElementSibling !== next && cell.nextElementSibling; }, 1500);
+      });
+    });
+    return target.then(function (c) { return c && waitFor(function () { return editorOf(c); }, 2000).then(function (view) {
+      if (!view) return false;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: code } });
+      S.answerCell = c; c.scrollIntoView({ block: 'nearest' });
+      return true;
+    }); }).catch(function () { return false; });
+  }
   function showCode(out, code) {
     var pre = el('pre', 'kca-final', code); pre.title = 'Click to copy';
     pre.addEventListener('click', function () {
@@ -395,7 +428,11 @@
     out.appendChild(steps);
     Promise.resolve().then(function () { return agent(text, steps); }).then(function () {
       if (S.abort.signal.aborted) add(out, 'kca-note', '(stopped)');
-      else if (!S.showSteps) { var code = finalCode(); if (code) showCode(out, code); else add(out, 'kca-note', '(no answer — type /steps and ask again to see what happened)'); }
+      else if (!S.showSteps) {
+        var code = finalCode();
+        if (!code) add(out, 'kca-note', '(no answer — type /steps and ask again to see what happened)');
+        else return putInCell(code).then(function (ok) { if (ok) add(out, 'kca-note', '↓ the code is in the cell below — press ▶ to run it'); else showCode(out, code); });
+      }
     }).catch(function (e) {
       if (e.name === 'AbortError') add(out, 'kca-note', '(stopped)');
       else add(out, 'kca-err', String(e.message || e));

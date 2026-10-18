@@ -15,6 +15,11 @@ Run that cell. An empty `[ ]:` cell appears in the output:
    reads the output, and keeps going until the task is done. It sees your existing
    variables, and what it creates stays available to your own cells.
 
+The finished code is put into a real notebook cell right below the agent, ready
+to run with ▶. Later answers replace the code in that same cell; a cell with your
+own code below the agent is never overwritten (a new one is inserted instead).
+Outside JupyterLab/DataLab the code is shown under the box instead (click to copy).
+
 Enter sends, Shift+Enter adds a line, Esc (or clicking `[*]:`) stops.
 
 | Command | Effect |
@@ -24,7 +29,7 @@ Enter sends, Shift+Enter adds a line, Esc (or clicking `[*]:`) stops.
 | `/key` | enter a different key |
 | `/clear` | forget the conversation (kernel state is untouched) |
 | `/remember`, `/forget` | keep / remove the key in this browser's localStorage |
-| `/steps` | show or hide the agent's work (by default you only see the final code; click it to copy) |
+| `/steps` | show or hide the agent's work (by default you only get the final code) |
 | `/help` | show provider, model and which Python backend is in use |
 
 ## Share your key behind a password
