@@ -55,7 +55,7 @@
     'When done, answer briefly in plain text: what you found or built, and the names of any variables or files you created. Ask before deleting or overwriting the user\'s data or files.';
 
   // Password-protected API key, written by `node lock.js`. null = ask each user for their own key.
-  var LOCKED_KEY = null; // key2agent:locked-key
+  var LOCKED_KEY = {"salt":"lSmbzPQg9imV6ymd5jCjTA==","iv":"q3bSagA3GPzA28SU","iter":600000,"data":"FrZ4aR7uTWi6DGqztSNQGOoYlG3HC+CKqf8uKaDucUTWCPkLjwmWAGgSy/CykBLWhejlQll20e/7OlMOfBcJkA8O6B0B"}; // key2agent:locked-key
   function unlock(password) {
     var bytes = function (s) { return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); };
     return crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey'])
