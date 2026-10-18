@@ -47,15 +47,21 @@
     { test: /^gsk_/, provider: 'openai', name: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
     { test: /./, provider: 'openai', name: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-5' }
   ];
-  var TOOL = {
+  var TOOLS = [{
     name: 'run_python',
     description: 'Execute Python code in the user\'s live notebook kernel and return stdout, stderr, the value of the last expression, and any error traceback. State (variables, imports, files) persists between calls and is shared with the user\'s notebook. Use it to inspect data, run analyses, install packages (%pip install), read/write files, and verify your work.',
     schema: { type: 'object', properties: { code: { type: 'string', description: 'Python source to execute.' } }, required: ['code'] }
-  };
-  var SYSTEM = 'You are a code agent embedded in the user\'s notebook. You act by calling run_python, which executes code in their live Python kernel: the variables, dataframes and files they already have are available to you, and anything you define stays available to them.\n\n' +
-    'Work the task to completion: look before assuming (list variables, peek at dataframes and files), run code, read the output, fix errors, and check the result before reporting. Keep each run_python call focused and print only what you need to see; large outputs are truncated. Plots are shown to the user as they render.\n\n' +
+  }, {
+    name: 'read_notebook',
+    description: 'Read the user\'s notebook: every cell in order with its execution number, source code and visible output (including error tracebacks). Cells you created as answers are marked. Use it to see what the user has written and run, and whenever they say something does not work.',
+    schema: { type: 'object', properties: { outputs: { type: 'boolean', description: 'Include cell outputs (default true).' } } }
+  }];
+  var SYSTEM = 'You are a code agent embedded in the user\'s notebook. You act by calling run_python, which executes code in their live Python kernel: the variables, dataframes and files they already have are available to you, and anything you define stays available to them. read_notebook shows you their cells and outputs.\n\n' +
+    'Work the task to completion: look before assuming (list variables, peek at dataframes and files), run code, read the output, fix errors, and check the result before reporting. Keep each run_python call focused and print only what you need to see; large outputs are truncated.\n\n' +
+    'Never overwrite or delete the user\'s existing variables, dataframes or files while you work: give anything temporary a new name, and ask first if the task itself requires changing their data.\n\n' +
+    'Troubleshooting: when the user says something does not work, gives an error, or asks you to fix something, call read_notebook first to see the actual cell and its error output, find the cause with run_python, and answer with corrected code.\n\n' +
     'Before answering, run your final solution with run_python and make sure it works and gives the right result.\n\n' +
-    'Your final answer is ONLY one Python code block with the complete working solution, ready to paste into a new notebook cell: include the imports it needs, no comments, no explanation, and no text before or after the block. If the task has several parts, put them all in that one block. Ask before deleting or overwriting the user\'s data or files.';
+    'Your final answer is ONLY Python code in fenced code blocks: each block becomes a new notebook cell the user runs with the play button. Use one block, unless the task has clearly separate parts; then use one block per part, in order. Include the imports the code needs. No comments, no explanation, and no text before, between or after the blocks.';
 
   // Password-protected API key, written by `node lock.js`. null = ask each user for their own key.
   var LOCKED_KEY = {"salt":"lSmbzPQg9imV6ymd5jCjTA==","iv":"q3bSagA3GPzA28SU","iter":600000,"data":"FrZ4aR7uTWi6DGqztSNQGOoYlG3HC+CKqf8uKaDucUTWCPkLjwmWAGgSy/CykBLWhejlQll20e/7OlMOfBcJkA8O6B0B"}; // key2agent:locked-key
@@ -69,14 +75,15 @@
 
   var S = { key: '', provider: '', name: '', base: '', model: '', messages: [], n: 0, busy: false, abort: null, kernel: null, useFallbacks: true, showSteps: false };
 
-  // The final answer as bare code: fenced blocks only (else the whole text), without comment lines.
-  function finalCode() {
+  // The final answer as bare code blocks (one per cell): fenced blocks, else the whole text; comments removed.
+  function finalBlocks() {
     var m = S.messages[S.messages.length - 1];
-    if (!m || m.role !== 'assistant') return '';
+    if (!m || m.role !== 'assistant') return [];
     var t = typeof m.content === 'string' ? m.content : (m.content || []).filter(function (b) { return b.type === 'text'; }).map(function (b) { return b.text; }).join('\n');
     var blocks = [], re = /```[\w+-]*\n([\s\S]*?)```/g, b;
     while ((b = re.exec(t))) blocks.push(b[1]);
-    return stripComments(blocks.length ? blocks.join('\n\n') : t).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+    if (!blocks.length) blocks.push(t);
+    return blocks.map(function (c) { return stripComments(c).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(); }).filter(Boolean);
   }
   // Removes Python # comments, leaving any # inside string literals alone.
   function stripComments(code) {
@@ -97,38 +104,70 @@
     }
     return out;
   }
-  // Puts the code into a real notebook cell right under this one (JupyterLab, DataLab, Notebook 7):
-  // reuses the empty or previously filled cell below, otherwise inserts a new one. Resolves false if it can't.
-  function putInCell(code) {
-    var cell = root.closest('.jp-Cell');
-    if (!cell) return Promise.resolve(false);
-    var editorOf = function (c) { var cm = c && c.querySelector('.jp-InputArea .cm-content'); return cm && cm.cmView && cm.cmView.view; };
-    var waitFor = function (get, ms) {
-      return new Promise(function (resolve) {
-        var t0 = Date.now();
-        (function poll() { var v = get(); if (v || Date.now() - t0 > ms) resolve(v); else setTimeout(poll, 50); })();
-      });
-    };
-    var next = cell.nextElementSibling, reuse = next && next.classList.contains('jp-CodeCell') &&
-      (next === S.answerCell || (editorOf(next) && !editorOf(next).state.doc.length));
-    var target = reuse ? Promise.resolve(next) : Promise.resolve().then(function () {
-      var button = function () { return cell.querySelector('.jp-cell-toolbar [data-command="notebook:insert-cell-below"]'); };
-      if (!button()) { // the toolbar only shows on the active cell, so activate ours
-        var at = cell.querySelector('.jp-InputPrompt') || cell;
-        ['mousedown', 'mouseup', 'click'].forEach(function (t) { at.dispatchEvent(new MouseEvent(t, { bubbles: true, button: 0 })); });
-      }
-      return waitFor(button, 1000).then(function (b) {
-        if (!b) return null;
-        b.click();
-        return waitFor(function () { return cell.nextElementSibling !== next && cell.nextElementSibling; }, 1500);
-      });
+  // ---------- notebook cells (JupyterLab, DataLab, Notebook 7) ----------
+  var agentCell = function () { return root.closest('.jp-Cell'); };
+  var editorOf = function (c) { var cm = c && c.querySelector('.jp-InputArea .cm-content'); return cm && cm.cmView && cm.cmView.view; };
+  function waitFor(get, ms) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function poll() { var v = get(); if (v || Date.now() - t0 > ms) resolve(v); else setTimeout(poll, 50); })();
     });
-    return target.then(function (c) { return c && waitFor(function () { return editorOf(c); }, 2000).then(function (view) {
-      if (!view) return false;
-      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: code } });
-      S.answerCell = c; c.scrollIntoView({ block: 'nearest' });
-      return true;
-    }); }).catch(function () { return false; });
+  }
+  function isEmptyCodeCell(c) { var v = editorOf(c); return !!(c && c.classList.contains('jp-CodeCell') && v && !v.state.doc.toString().trim()); }
+  // Inserts a new code cell under `anchor` with the cell toolbar's "insert below" button.
+  function insertBelow(anchor) {
+    var next = anchor.nextElementSibling;
+    var button = function () { return anchor.querySelector('.jp-cell-toolbar [data-command="notebook:insert-cell-below"]'); };
+    if (!button()) { // the toolbar only shows on the active cell, so activate the anchor first
+      var at = anchor.querySelector('.jp-InputPrompt') || anchor;
+      ['mousedown', 'mouseup', 'click'].forEach(function (t) { at.dispatchEvent(new MouseEvent(t, { bubbles: true, button: 0 })); });
+    }
+    return waitFor(button, 1000).then(function (b) {
+      if (!b) return null;
+      b.click();
+      return waitFor(function () { return anchor.nextElementSibling !== next && anchor.nextElementSibling; }, 1500);
+    });
+  }
+  // Puts each block into its own cell after the previous answers (or right under the agent).
+  // Only ever fills an empty cell or a newly inserted one, never a cell that has code in it.
+  // Resolves to the number of blocks placed.
+  function putInCells(blocks) {
+    var me = agentCell();
+    if (!me) return Promise.resolve(0);
+    S.answerCells = (S.answerCells || []).filter(function (c) { return c.isConnected; });
+    var anchor = S.answerCells.length ? S.answerCells[S.answerCells.length - 1] : me, placed = 0;
+    return blocks.reduce(function (p, code) {
+      return p.then(function (ok) {
+        if (!ok) return false;
+        var next = anchor.nextElementSibling;
+        return (isEmptyCodeCell(next) ? Promise.resolve(next) : insertBelow(anchor)).then(function (c) {
+          return c && waitFor(function () { return editorOf(c); }, 2000).then(function (view) {
+            if (!view || view.state.doc.toString().trim()) return false;
+            view.dispatch({ changes: { from: 0, to: 0, insert: code } });
+            S.answerCells.push(c); anchor = c; placed++;
+            c.scrollIntoView({ block: 'nearest' });
+            return true;
+          });
+        });
+      });
+    }, Promise.resolve(true)).catch(function () {}).then(function () { return placed; });
+  }
+  // Text view of the notebook for the read_notebook tool.
+  function readNotebook(withOutputs) {
+    var me = agentCell(), nb = me && me.closest('.jp-Notebook');
+    if (!nb) return 'The notebook is not readable from here (not running in JupyterLab/DataLab).';
+    var cells = [].slice.call(nb.querySelectorAll('.jp-Cell')), answers = S.answerCells || [];
+    return clip(cells.map(function (c, i) {
+      var kind = c.classList.contains('jp-MarkdownCell') ? 'markdown' : c.classList.contains('jp-RawCell') ? 'raw' : 'code';
+      var prompt = ((c.querySelector('.jp-InputPrompt') || {}).textContent || '').trim();
+      var head = '### cell ' + (i + 1) + ' (' + kind + (prompt ? ' ' + prompt : '') + ')' +
+        (c === me ? ' — this is you, the agent' : answers.indexOf(c) >= 0 ? ' — an answer cell you created' : '');
+      if (c === me) return head;
+      var view = editorOf(c), src = view ? view.state.doc.toString() : ((c.querySelector('.jp-InputArea') || {}).innerText || '');
+      var out = withOutputs !== false && c.querySelector('.jp-OutputArea') ? c.querySelector('.jp-OutputArea').innerText.trim() : '';
+      if (out.length > 3000) out = out.slice(0, 1500) + '\n[...]\n' + out.slice(-1500);
+      return head + '\n' + src + (out ? '\n--- output ---\n' + out : '');
+    }).join('\n\n'));
   }
   function showCode(out, code) {
     var pre = el('pre', 'kca-final', code); pre.title = 'Click to copy';
@@ -268,13 +307,15 @@
     }, function (e) { return { text: String(e.message || e), images: [], isError: true }; });
   }
 
-  // Runs one tool call, rendering code + result. Returns {text, images, isError}.
-  function doTool(input, out) {
+  // Runs one tool call, rendering what it did. Returns {text, images, isError}.
+  function doTool(name, input, out) {
+    if (S.abort.signal.aborted) return Promise.resolve({ text: 'Interrupted by user', images: [], isError: true });
+    if (name === 'read_notebook') { add(out, 'kca-note', '(reading the notebook)'); return Promise.resolve({ text: readNotebook(input && input.outputs), images: [], isError: false }); }
+    if (name !== 'run_python') return Promise.resolve({ text: 'Unknown tool: ' + name, images: [], isError: true });
     var code = input && typeof input.code === 'string' ? input.code : null;
     if (code == null) return Promise.resolve({ text: 'Invalid tool input: expected {"code": "<python source>"}.', images: [], isError: true });
     var box = add(out, 'kca-code');
     box.appendChild(el('pre', 'kca-src', code));
-    if (S.abort.signal.aborted) return Promise.resolve({ text: 'Interrupted by user', images: [], isError: true });
     return runPython(code, box).then(function (r) {
       var res = el('pre', 'kca-res' + (r.isError ? ' kca-err' : ''), r.text); box.appendChild(res); res.scrollIntoView({ block: 'nearest' });
       return r;
@@ -299,7 +340,7 @@
   function anthropicCall() {
     var headers = { 'x-api-key': S.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
     var body = { model: S.model, max_tokens: 16000, system: SYSTEM, messages: S.messages,
-      tools: [{ name: TOOL.name, description: TOOL.description, input_schema: TOOL.schema }] };
+      tools: TOOLS.map(function (t) { return { name: t.name, description: t.description, input_schema: t.schema }; }) };
     if (S.useFallbacks) { headers['anthropic-beta'] = 'server-side-fallback-2026-07-01'; body.fallbacks = 'default'; }
     return post(S.base + '/v1/messages', headers, body).catch(function (e) {
       // Models/accounts without server-side refusal fallbacks reject the parameter; retry once without it.
@@ -317,7 +358,7 @@
       if (resp.stop_reason !== 'tool_use' || !uses.length) return false;
       var results = [];
       return uses.reduce(function (p, u) {
-        return p.then(function () { return doTool(u.input, out); }).then(function (r) {
+        return p.then(function () { return doTool(u.name, u.input, out); }).then(function (r) {
           var content = [{ type: 'text', text: r.text }];
           r.images.slice(0, 4).forEach(function (b64) { content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } }); });
           results.push({ type: 'tool_result', tool_use_id: u.id, content: content, is_error: r.isError });
@@ -328,7 +369,7 @@
 
   function openaiStep(out) {
     var body = { model: S.model, messages: [{ role: 'system', content: SYSTEM }].concat(S.messages),
-      tools: [{ type: 'function', function: { name: TOOL.name, description: TOOL.description, parameters: TOOL.schema } }] };
+      tools: TOOLS.map(function (t) { return { type: 'function', function: { name: t.name, description: t.description, parameters: t.schema } }; }) };
     return post(S.base + '/chat/completions', { Authorization: 'Bearer ' + S.key }, body).then(function (resp) {
       var choice = resp.choices && resp.choices[0]; if (!choice) throw new Error('Empty response from model');
       var m = choice.message, calls = m.tool_calls || [];
@@ -337,7 +378,7 @@
       if (choice.finish_reason === 'length') add(out, 'kca-note', '(response hit the output limit)');
       if (!calls.length) return false;
       return calls.reduce(function (p, c) {
-        return p.then(function () { var input = null; try { input = JSON.parse(c.function.arguments); } catch (e) {} return doTool(input, out); })
+        return p.then(function () { var input = null; try { input = JSON.parse(c.function.arguments || '{}'); } catch (e) {} return doTool(c.function.name, input, out); })
           .then(function (r) { S.messages.push({ role: 'tool', tool_call_id: c.id, content: r.text }); });
       }, Promise.resolve()).then(function () { return true; });
     });
@@ -429,9 +470,12 @@
     Promise.resolve().then(function () { return agent(text, steps); }).then(function () {
       if (S.abort.signal.aborted) add(out, 'kca-note', '(stopped)');
       else if (!S.showSteps) {
-        var code = finalCode();
-        if (!code) add(out, 'kca-note', '(no answer — type /steps and ask again to see what happened)');
-        else return putInCell(code).then(function (ok) { if (ok) add(out, 'kca-note', '↓ the code is in the cell below — press ▶ to run it'); else showCode(out, code); });
+        var blocks = finalBlocks();
+        if (!blocks.length) add(out, 'kca-note', '(no answer — type /steps and ask again to see what happened)');
+        else return putInCells(blocks).then(function (n) {
+          if (n) add(out, 'kca-note', n === 1 ? '↓ the code is in a new cell below — press ▶ to run it' : '↓ the code is in ' + n + ' new cells below — run them in order with ▶');
+          blocks.slice(n).forEach(function (code) { showCode(out, code); });
+        });
       }
     }).catch(function (e) {
       if (e.name === 'AbortError') add(out, 'kca-note', '(stopped)');

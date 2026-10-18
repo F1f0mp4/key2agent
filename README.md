@@ -15,10 +15,16 @@ Run that cell. An empty `[ ]:` cell appears in the output:
    reads the output, and keeps going until the task is done. It sees your existing
    variables, and what it creates stays available to your own cells.
 
-The finished code is put into a real notebook cell right below the agent, ready
-to run with ▶. Later answers replace the code in that same cell; a cell with your
-own code below the agent is never overwritten (a new one is inserted instead).
-Outside JupyterLab/DataLab the code is shown under the box instead (click to copy).
+The finished code goes into new notebook cells below the agent, ready to run
+with ▶. Each answer gets its own cell (one per part for multi-part tasks), added
+after the previous answers. Cells with code in them are never overwritten; only
+an empty cell is reused. Outside JupyterLab/DataLab the code is shown under the
+box instead (click to copy).
+
+If an answer fails when you run it, type "fix it" (or describe the problem). The
+agent reads the notebook, including the cell's error output, and answers with
+corrected code in a new cell. While it works it never reuses the names of your
+existing variables.
 
 Enter sends, Shift+Enter adds a line, Esc (or clicking `[*]:`) stops.
 
