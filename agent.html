@@ -27,6 +27,8 @@
 .kca-code img{display:block;max-width:100%;margin:6px 9px}
 .kca-note{color:var(--kca-dim);opacity:.8;margin:6px 0;white-space:pre-wrap}
 .kca-err{color:var(--kca-err);white-space:pre-wrap;word-break:break-word;margin:6px 0}
+.kca-final{margin:6px 0;padding:8px 9px;background:var(--kca-bg);border:1px solid var(--kca-bd);font:inherit;white-space:pre;overflow-x:auto;cursor:copy}
+.kca-final.kca-copied{border-color:var(--kca-hi)}
 </style>
 <div class="kca" data-lm-suppress-shortcuts="true"></div>
 <script>
@@ -52,7 +54,8 @@
   };
   var SYSTEM = 'You are a code agent embedded in the user\'s notebook. You act by calling run_python, which executes code in their live Python kernel: the variables, dataframes and files they already have are available to you, and anything you define stays available to them.\n\n' +
     'Work the task to completion: look before assuming (list variables, peek at dataframes and files), run code, read the output, fix errors, and check the result before reporting. Keep each run_python call focused and print only what you need to see; large outputs are truncated. Plots are shown to the user as they render.\n\n' +
-    'When done, answer briefly in plain text: what you found or built, and the names of any variables or files you created. Ask before deleting or overwriting the user\'s data or files.';
+    'Before answering, run your final solution with run_python and make sure it works and gives the right result.\n\n' +
+    'Your final answer is ONLY one Python code block with the complete working solution, ready to paste into a new notebook cell: include the imports it needs, no comments, no explanation, and no text before or after the block. If the task has several parts, put them all in that one block. Ask before deleting or overwriting the user\'s data or files.';
 
   // Password-protected API key, written by `node lock.js`. null = ask each user for their own key.
   var LOCKED_KEY = {"salt":"lSmbzPQg9imV6ymd5jCjTA==","iv":"q3bSagA3GPzA28SU","iter":600000,"data":"FrZ4aR7uTWi6DGqztSNQGOoYlG3HC+CKqf8uKaDucUTWCPkLjwmWAGgSy/CykBLWhejlQll20e/7OlMOfBcJkA8O6B0B"}; // key2agent:locked-key
@@ -64,7 +67,46 @@
       .then(function (buf) { return new TextDecoder().decode(buf); });
   }
 
-  var S = { key: '', provider: '', name: '', base: '', model: '', messages: [], n: 0, busy: false, abort: null, kernel: null, useFallbacks: true };
+  var S = { key: '', provider: '', name: '', base: '', model: '', messages: [], n: 0, busy: false, abort: null, kernel: null, useFallbacks: true, showSteps: false };
+
+  // The final answer as bare code: fenced blocks only (else the whole text), without comment lines.
+  function finalCode() {
+    var m = S.messages[S.messages.length - 1];
+    if (!m || m.role !== 'assistant') return '';
+    var t = typeof m.content === 'string' ? m.content : (m.content || []).filter(function (b) { return b.type === 'text'; }).map(function (b) { return b.text; }).join('\n');
+    var blocks = [], re = /```[\w+-]*\n([\s\S]*?)```/g, b;
+    while ((b = re.exec(t))) blocks.push(b[1]);
+    return stripComments(blocks.length ? blocks.join('\n\n') : t).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  // Removes Python # comments, leaving any # inside string literals alone.
+  function stripComments(code) {
+    var out = '', q = null, i = 0, n = code.length;
+    while (i < n) {
+      var c = code[i];
+      if (q) {
+        if (c === '\\') { out += code.substr(i, 2); i += 2; }
+        else if (code.startsWith(q, i)) { out += q; i += q.length; q = null; }
+        else { out += c; i++; }
+      } else if (c === '#') {
+        var lineStart = out.lastIndexOf('\n') + 1, wholeLine = /^\s*$/.test(out.slice(lineStart));
+        while (i < n && code[i] !== '\n') i++;
+        if (wholeLine) { out = out.slice(0, lineStart); i++; }
+      } else if (c === '"' || c === "'") {
+        q = code.startsWith(c + c + c, i) ? c + c + c : c; out += q; i += q.length;
+      } else { out += c; i++; }
+    }
+    return out;
+  }
+  function showCode(out, code) {
+    var pre = el('pre', 'kca-final', code); pre.title = 'Click to copy';
+    pre.addEventListener('click', function () {
+      var r = document.createRange(); r.selectNodeContents(pre); var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      var done = function () { pre.classList.add('kca-copied'); setTimeout(function () { pre.classList.remove('kca-copied'); }, 900); };
+      if (navigator.clipboard) navigator.clipboard.writeText(code).then(done, function () { try { document.execCommand('copy') && done(); } catch (e) {} });
+      else try { document.execCommand('copy') && done(); } catch (e) {}
+    });
+    out.appendChild(pre); pre.scrollIntoView({ block: 'nearest' });
+  }
   var area, promptEl, inputEl;
 
   // ---------- tiny DOM helpers ----------
@@ -289,13 +331,15 @@
       'Enter sends, Shift+Enter adds a line, Esc (or click [*]) stops.\n' +
       '/model <id>   switch model          /base <url>   OpenAI-compatible endpoint\n' +
       '/key          enter a different key /clear        forget the conversation\n' +
-      '/remember     keep key in this browser (localStorage)   /forget   remove it';
+      '/remember     keep key in this browser (localStorage)   /forget   remove it\n' +
+      '/steps        show or hide the agent\'s work (default: final code only; click it to copy)';
   }
   function command(line, out) {
     var m = line.match(/^\/(\w+)\s*(.*)$/), cmd = m[1], arg = m[2].trim();
     if (cmd === 'model' && arg) { S.model = arg; add(out, 'kca-note', 'model → ' + arg); }
     else if (cmd === 'base' && arg) { S.base = arg.replace(/\/$/, ''); S.provider = 'openai'; S.name = 'OpenAI-compatible'; S.messages = []; add(out, 'kca-note', 'endpoint → ' + S.base + ' (set the model with /model)'); }
     else if (cmd === 'key') { S.key = ''; S.messages = []; }
+    else if (cmd === 'steps') { S.showSteps = !S.showSteps; add(out, 'kca-note', S.showSteps ? 'showing every step the agent takes' : 'showing only the final code'); }
     else if (cmd === 'clear') { S.messages = []; add(out, 'kca-note', 'conversation cleared (kernel state is untouched)'); }
     else if (cmd === 'remember') { try { localStorage.setItem(STORE, JSON.stringify({ key: S.key, provider: S.provider, name: S.name, base: S.base, model: S.model })); add(out, 'kca-note', 'saved in this browser'); } catch (e) { add(out, 'kca-err', 'browser storage is not available here'); } }
     else if (cmd === 'forget') { try { localStorage.removeItem(STORE); } catch (e) {} add(out, 'kca-note', 'removed from this browser'); }
@@ -342,8 +386,13 @@
     S.busy = true; S.abort = new AbortController();
     inputEl.readOnly = true; promptEl.textContent = '[*]:'; promptEl.classList.add('kca-busy'); promptEl.title = 'Click to stop';
     area.appendChild(out);
-    var p = promptEl, live = inputEl;
-    Promise.resolve().then(function () { return agent(text, out); }).catch(function (e) {
+    var p = promptEl, live = inputEl, steps = el('div');
+    if (!S.showSteps) steps.style.display = 'none';
+    out.appendChild(steps);
+    Promise.resolve().then(function () { return agent(text, steps); }).then(function () {
+      if (S.abort.signal.aborted) add(out, 'kca-note', '(stopped)');
+      else if (!S.showSteps) { var code = finalCode(); if (code) showCode(out, code); else add(out, 'kca-note', '(no answer — type /steps and ask again to see what happened)'); }
+    }).catch(function (e) {
       if (e.name === 'AbortError') add(out, 'kca-note', '(stopped)');
       else add(out, 'kca-err', String(e.message || e));
       // Drop a trailing turn the model never answered so the history stays valid.

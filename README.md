@@ -24,6 +24,7 @@ Enter sends, Shift+Enter adds a line, Esc (or clicking `[*]:`) stops.
 | `/key` | enter a different key |
 | `/clear` | forget the conversation (kernel state is untouched) |
 | `/remember`, `/forget` | keep / remove the key in this browser's localStorage |
+| `/steps` | show or hide the agent's work (by default you only see the final code; click it to copy) |
 | `/help` | show provider, model and which Python backend is in use |
 
 ## Share your key behind a password
