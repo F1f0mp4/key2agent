@@ -40,7 +40,7 @@
   var PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
   var PRESETS = [
     { test: /^sk-ant-/, provider: 'anthropic', name: 'Anthropic', base: 'https://api.anthropic.com', model: 'claude-opus-5-5' },
-    { test: /^AIza/, provider: 'openai', name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-pro' },
+    { test: /^(AIza|AQ\.)/, provider: 'openai', name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-pro' },
     { test: /^sk-or-/, provider: 'openai', name: 'OpenRouter', base: 'https://openrouter.ai/api/v1', model: 'openrouter/auto' },
     { test: /^gsk_/, provider: 'openai', name: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
     { test: /./, provider: 'openai', name: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-5' }
@@ -53,6 +53,16 @@
   var SYSTEM = 'You are a code agent embedded in the user\'s notebook. You act by calling run_python, which executes code in their live Python kernel: the variables, dataframes and files they already have are available to you, and anything you define stays available to them.\n\n' +
     'Work the task to completion: look before assuming (list variables, peek at dataframes and files), run code, read the output, fix errors, and check the result before reporting. Keep each run_python call focused and print only what you need to see; large outputs are truncated. Plots are shown to the user as they render.\n\n' +
     'When done, answer briefly in plain text: what you found or built, and the names of any variables or files you created. Ask before deleting or overwriting the user\'s data or files.';
+
+  // Password-protected API key, written by `node lock.js`. null = ask each user for their own key.
+  var LOCKED_KEY = null; // key2agent:locked-key
+  function unlock(password) {
+    var bytes = function (s) { return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); };
+    return crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey'])
+      .then(function (k) { return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: bytes(LOCKED_KEY.salt), iterations: LOCKED_KEY.iter, hash: 'SHA-256' }, k, { name: 'AES-GCM', length: 256 }, false, ['decrypt']); })
+      .then(function (k) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes(LOCKED_KEY.iv) }, k, bytes(LOCKED_KEY.data)); })
+      .then(function (buf) { return new TextDecoder().decode(buf); });
+  }
 
   var S = { key: '', provider: '', name: '', base: '', model: '', messages: [], n: 0, busy: false, abort: null, kernel: null, useFallbacks: true };
   var area, promptEl, inputEl;
@@ -298,7 +308,7 @@
     var cell = el('div', 'kca-cell');
     promptEl = el('div', 'kca-prompt', '[ ]:');
     if (S.key) { inputEl = el('textarea'); inputEl.rows = 1; inputEl.placeholder = 'Ask the agent…  (/help)'; }
-    else { inputEl = el('input'); inputEl.type = 'password'; inputEl.autocomplete = 'off'; inputEl.placeholder = 'Paste an LLM API key and press Enter  (Anthropic, OpenAI, Gemini, OpenRouter, Groq)'; }
+    else { inputEl = el('input'); inputEl.type = 'password'; inputEl.autocomplete = 'off'; inputEl.placeholder = LOCKED_KEY ? 'Password' : 'Paste an LLM API key and press Enter  (Anthropic, OpenAI, Gemini, OpenRouter, Groq)'; }
     inputEl.spellcheck = false;
     inputEl.addEventListener('input', grow);
     inputEl.addEventListener('keydown', onKey);
@@ -319,10 +329,13 @@
     var cell = inputEl.parentNode, wasKey = !S.key, frozen = el('div', 'kca-in', wasKey ? '•'.repeat(12) : text);
     var out = el('div', 'kca-out');
     if (wasKey) {
-      setKey(text); cell.replaceChild(frozen, inputEl); promptEl.textContent = '[✓]:'; area.appendChild(out);
-      var note = add(out, 'kca-note', describe());
-      kernelReady.then(function () { note.textContent = describe(); }, function () { add(out, 'kca-err', 'No Python backend could be started; the agent can chat but not run code.'); });
-      newCell();
+      var p0 = promptEl;
+      cell.replaceChild(frozen, inputEl); area.appendChild(out);
+      (LOCKED_KEY ? unlock(text) : Promise.resolve(text)).then(function (key) {
+        setKey(key.trim()); p0.textContent = '[✓]:';
+        var note = add(out, 'kca-note', describe());
+        kernelReady.then(function () { note.textContent = describe(); }, function () { add(out, 'kca-err', 'No Python backend could be started; the agent can chat but not run code.'); });
+      }, function () { p0.textContent = '[✗]:'; add(out, 'kca-err', 'Wrong password.'); }).then(newCell);
       return;
     }
     if (text[0] === '/') { cell.replaceChild(frozen, inputEl); area.appendChild(out); command(text, out); newCell(); return; }

@@ -26,6 +26,26 @@ Enter sends, Shift+Enter adds a line, Esc (or clicking `[*]:`) stops.
 | `/remember`, `/forget` | keep / remove the key in this browser's localStorage |
 | `/help` | show provider, model and which Python backend is in use |
 
+## Share your key behind a password
+
+To let people use the agent without their own key, lock yours into `agent.html`:
+
+```bash
+node lock.js
+```
+
+It asks for the API key and a password (both hidden), encrypts the key with the
+password (AES-256-GCM, PBKDF2 with 600,000 rounds) and writes the result into
+`agent.html`. Upload that file to GitHub. Users then see a `Password` cell instead
+of a key cell. `node lock.js --remove` switches back to asking for a key.
+
+- Anyone with the password can recover the key from their browser's developer
+  tools, because the browser sends it to the provider. Only give the password to
+  people you would trust with the key, and set a spending limit on it.
+- The encrypted key is public in the repo, so a short password can be guessed
+  offline. Use a long one (the script requires 12+ characters).
+- To change the password or key, run `node lock.js` again and re-upload.
+
 ## How it works
 
 `agent.html` is one self-contained file: no build step, no Python package.
