@@ -42,7 +42,7 @@
   var PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
   var PRESETS = [
     { test: /^sk-ant-/, provider: 'anthropic', name: 'Anthropic', base: 'https://api.anthropic.com', model: 'claude-opus-5-5' },
-    { test: /^(AIza|AQ\.)/, provider: 'openai', name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-pro' },
+    { test: /^(AIza|AQ\.)/, provider: 'openai', name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash' },
     { test: /^sk-or-/, provider: 'openai', name: 'OpenRouter', base: 'https://openrouter.ai/api/v1', model: 'openrouter/auto' },
     { test: /^gsk_/, provider: 'openai', name: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
     { test: /./, provider: 'openai', name: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-5' }
@@ -107,7 +107,7 @@
     });
     out.appendChild(pre); pre.scrollIntoView({ block: 'nearest' });
   }
-  var area, promptEl, inputEl;
+  var promptEl, inputEl;
 
   // ---------- tiny DOM helpers ----------
   function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
@@ -346,19 +346,26 @@
     else add(out, 'kca-note', describe());
   }
 
-  // ---------- the cell ----------
+  // ---------- the cell: one input box that is reused, one output area under it ----------
+  var outEl;
   function grow() { if (inputEl.tagName === 'TEXTAREA') { inputEl.style.height = 'auto'; inputEl.style.height = Math.max(38, inputEl.scrollHeight + 2) + 'px'; } }
-  function newCell() {
-    var cell = el('div', 'kca-cell');
-    promptEl = el('div', 'kca-prompt', '[ ]:');
+  function setInput() {
+    var old = inputEl;
     if (S.key) { inputEl = el('textarea'); inputEl.rows = 1; inputEl.placeholder = 'Ask the agent…  (/help)'; }
     else { inputEl = el('input'); inputEl.type = 'password'; inputEl.autocomplete = 'off'; inputEl.placeholder = LOCKED_KEY ? 'Password' : 'Paste an LLM API key and press Enter  (Anthropic, OpenAI, Gemini, OpenRouter, Groq)'; }
     inputEl.spellcheck = false;
     inputEl.addEventListener('input', grow);
     inputEl.addEventListener('keydown', onKey);
-    promptEl.addEventListener('click', stop);
-    cell.appendChild(promptEl); cell.appendChild(inputEl); area.appendChild(cell);
+    if (old) old.parentNode.replaceChild(inputEl, old); else promptEl.parentNode.appendChild(inputEl);
     inputEl.focus({ preventScroll: true });
+  }
+  function build() {
+    var cell = el('div', 'kca-cell');
+    promptEl = el('div', 'kca-prompt', '[ ]:');
+    promptEl.addEventListener('click', stop);
+    cell.appendChild(promptEl); root.appendChild(cell);
+    outEl = el('div', 'kca-out'); root.appendChild(outEl);
+    setInput();
   }
   function stop() { if (S.busy && S.abort) S.abort.abort(); }
   function onKey(ev) {
@@ -370,23 +377,20 @@
     submit(text);
   }
   function submit(text) {
-    var cell = inputEl.parentNode, wasKey = !S.key, frozen = el('div', 'kca-in', wasKey ? '•'.repeat(12) : text);
-    var out = el('div', 'kca-out');
-    if (wasKey) {
-      var p0 = promptEl;
-      cell.replaceChild(frozen, inputEl); area.appendChild(out);
+    var out = outEl;
+    out.textContent = '';
+    if (!S.key) {
+      inputEl.readOnly = true;
       (LOCKED_KEY ? unlock(text) : Promise.resolve(text)).then(function (key) {
-        setKey(key.trim()); p0.textContent = '[✓]:';
-        var note = add(out, 'kca-note', describe());
-        kernelReady.then(function () { note.textContent = describe(); }, function () { add(out, 'kca-err', 'No Python backend could be started; the agent can chat but not run code.'); });
-      }, function () { p0.textContent = '[✗]:'; add(out, 'kca-err', 'Wrong password.'); }).then(newCell);
+        setKey(key.trim()); setInput();
+        kernelReady.catch(function () { add(out, 'kca-err', 'No Python backend could be started; the agent can chat but not run code.'); });
+      }, function () { add(out, 'kca-err', 'Wrong password.'); inputEl.readOnly = false; inputEl.value = ''; inputEl.focus(); });
       return;
     }
-    if (text[0] === '/') { cell.replaceChild(frozen, inputEl); area.appendChild(out); command(text, out); newCell(); return; }
+    if (text[0] === '/') { command(text, out); if (S.key) { inputEl.value = ''; grow(); } else setInput(); return; }
     S.busy = true; S.abort = new AbortController();
     inputEl.readOnly = true; promptEl.textContent = '[*]:'; promptEl.classList.add('kca-busy'); promptEl.title = 'Click to stop';
-    area.appendChild(out);
-    var p = promptEl, live = inputEl, steps = el('div');
+    var steps = el('div');
     if (!S.showSteps) steps.style.display = 'none';
     out.appendChild(steps);
     Promise.resolve().then(function () { return agent(text, steps); }).then(function () {
@@ -400,13 +404,13 @@
       if (last && last.role === 'user' && typeof last.content === 'string') S.messages.pop();
     }).then(function () {
       S.busy = false; S.n += 1;
-      cell.replaceChild(frozen, live); p.textContent = '[' + S.n + ']:'; p.classList.remove('kca-busy'); p.title = '';
-      newCell();
+      promptEl.textContent = '[' + S.n + ']:'; promptEl.classList.remove('kca-busy'); promptEl.title = '';
+      // Keep the question in the box, selected, so typing replaces it.
+      inputEl.readOnly = false; inputEl.focus({ preventScroll: true }); inputEl.select();
     });
   }
 
-  area = root;
   try { var saved = JSON.parse(localStorage.getItem(STORE) || 'null'); if (saved && saved.key) { S.key = saved.key; S.provider = saved.provider; S.name = saved.name; S.base = saved.base; S.model = saved.model; } } catch (e) {}
-  newCell();
+  build();
 })();
 </script>
